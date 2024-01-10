@@ -1,0 +1,68 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+import rospy
+import numpy as np
+from std_msgs.msg import Float64
+from geometry_msgs.msg import Twist
+
+class ControlLane():
+    def __init__(self):
+        rospy.init_node('control_lane')
+
+        self.pub_cmd_vel = rospy.Publisher('/cmd_vel', Twist, queue_size=1)
+        self.sub_lane = rospy.Subscriber('/detect/lane', Float64, self.cbFollowLane, queue_size=1)
+        self.sub_stop_detected = rospy.Subscriber('/control/stop_detected', Float64, self.cbStopDetected, queue_size=1)
+
+        self.lastError = 0
+        self.MAX_VEL = 0.1
+        self.stop_detected = False
+
+        rospy.on_shutdown(self.fnShutDown)
+
+    def cbStopDetected(self, stop_detected_msg):
+        self.stop_detected = stop_detected_msg.data == 1.0
+
+    def cbFollowLane(self, lane_center_msg):
+        if self.stop_detected:
+            rospy.loginfo("Stop detected, not updating cmd_vel.")
+            self.publish_zero_velocity()  # 정지 상태 유지
+            return
+
+        center = lane_center_msg.data
+        error = center - 320  # 예: 이미지 너비가 640픽셀일 경우
+
+        # PID 계산
+        Kp = 0.0025
+        Kd = 0.007
+        angular_z = Kp * error + Kd * (error - self.lastError)
+        self.lastError = error
+
+        # 차량 속도 설정
+        twist = Twist()
+        twist.linear.x = min(self.MAX_VEL * ((1 - abs(error) / 640) ** 2.2), 0.05)
+        twist.angular.z = -max(angular_z, -2.0) if angular_z < 0 else -min(angular_z, 2.0)
+
+        # stop_detected가 True이면 여기서 메시지를 발행하지 않음
+        if not self.stop_detected:
+            self.pub_cmd_vel.publish(twist)
+
+
+    def publish_zero_velocity(self):
+        twist = Twist()
+        twist.linear.x = 0
+        twist.angular.z = 0
+        self.pub_cmd_vel.publish(twist)
+
+    def fnShutDown(self):
+        rospy.loginfo("Shutting down. cmd_vel will be 0")
+        self.publish_zero_velocity()
+
+    def main(self):
+        rospy.spin()
+
+if __name__ == '__main__':
+    rospy.init_node('control_lane')
+    node = ControlLane()
+    node.main()
+

@@ -1,0 +1,307 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import rospy
+import cv2
+import numpy as np
+import time
+import math
+import psutil
+from ultralytics import YOLO
+from cv_bridge import CvBridge, CvBridgeError
+from std_msgs.msg import Float64, String
+from sensor_msgs.msg import CompressedImage, Image
+
+class WebcamDetector:
+    def __init__(self):
+        self.sub_image_type = "raw"  # "compressed" 또는 "raw" 중 선택 가능
+        self.pub_image_type = "compressed"  # "compressed" 또는 "raw" 중 선택 가능
+
+        # ROS 노드 및 퍼블리셔, 구독자 초기화
+        rospy.init_node('detect_stop', anonymous=True)
+        self.detection_pub = rospy.Publisher('/detection_results', String, queue_size=10)
+        self.image_pub = rospy.Publisher('/detect/image_stop_gazebo/compressed', CompressedImage, queue_size=10)
+        self.pub_center = rospy.Publisher('/detect/center', Float64, queue_size=1)
+        self.cvBridge = CvBridge()
+        self.pub_stop_signal = rospy.Publisher('/detect/stop_signal', Float64, queue_size=1)
+
+        if self.sub_image_type == "compressed":
+            self.sub_image_original = rospy.Subscriber('/camera/image_projected_compensated', CompressedImage, self.image_callback, queue_size=1)
+        elif self.sub_image_type == "raw":
+            self.sub_image_original = rospy.Subscriber('/camera/image_projected_compensated', Image, self.image_callback, queue_size=1)
+
+
+        # 로고 이미지 로드
+        self.logo_image = cv2.imread('/home/gogojeje/catkin_ws/src/turtlebot3_autorace_2020/turtlebot3_autorace_detect/nodes/images/kosais.png')  # 로고 이미지 경로 변경
+        self.show_logo_time = 3  # 로고 표시 시간 (초)
+        self.logo_display_start = rospy.get_time()  # 로고 표시 시작 시간 (현재 시간으로 초기화)
+
+        try:
+            self.model = YOLO('/home/gogojeje/catkin_ws/src/turtlebot3_autorace_2020/turtlebot3_autorace_detect/nodes/best-bod.pt')
+            rospy.loginfo("YOLO model successfully loaded.")
+        except Exception as e:
+            rospy.logerr(f"Failed to load YOLO model: {e}")
+
+        self.bridge = CvBridge()
+
+
+        self.prev_time = 0
+        self.out_bb = 40
+        self.in_bb = 10
+
+    def inoutside_determine(self, coordinates, standard_polygon):
+        result_count = 0
+
+        a,b,c,d = standard_polygon
+        standart_polygon=[[a,b],[a,d],[c,d],[c,b]]
+
+
+        for point in coordinates:
+            n = len(standart_polygon)
+            x, y = point
+            result = False
+
+            p1x, p1y = standart_polygon[0]
+            print(p1x,p1y)
+            for i in range(n + 1):
+                p2x, p2y = standart_polygon[i % n]
+                if y > min(p1y, p2y) and y <= max(p1y, p2y) and x <= max(p1x, p2x):
+                    if p1y != p2y:
+                        xinters = (y - p1y) * (p2x - p1x) / (p2y - p1y) + p1x
+                        if p1x == p2x or x <= xinters:
+                            result = not result
+                p1x, p1y = p2x, p2y
+
+            if result==True:
+                print("점은 다각형 내부에 있습니다.")
+                result_count += 1
+                print(result_count)
+
+            else:
+                print("점은 다각형 외부에 있습니다.")
+                result_count += 2
+                print(result_count)
+
+        return result_count
+
+    def get_bboxes_xyxy(self, image):
+        # 모델이 이미 초기화된 것으로 가정
+        results = self.model(image)
+
+        xyxy = []
+        xywh = []
+
+        if results:
+            for result in results:
+                if len(result.boxes) > 0:
+                    xyxy = result.boxes.xyxy.cpu().numpy()
+                    xywh = result.boxes.xywh.cpu().numpy()
+                else:
+                    xyxy = np.array([[0, 0, 0, 0]])
+                    xywh = np.array([[0, 0, 0, 0]])
+        else:
+            xyxy = np.array([[0, 0, 0, 0]])
+            xywh = np.array([[0, 0, 0, 0]])
+        return xyxy, xywh
+
+    def webcam_FPS_output(self, frame):
+        cur_time = time.time()
+        sec = cur_time - self.prev_time
+        self.prev_time = cur_time
+        fps = 1 / sec
+
+        # 프레임 수를 문자열에 저장
+        fps_str = "FPS: %d" % round(fps)
+
+        # 변경사항 적용: 글씨체, 크기, 굵기, 테두리
+        font = cv2.FONT_HERSHEY_SIMPLEX  # 변경된 글씨체
+        font_scale = 0.7  # 변경된 글씨 크기
+        thickness = 2  # 변경된 굵기
+
+        # 테두리 그리기
+        text_color_border = (0, 0, 0)  # 테두리 색상: 검정
+        cv2.putText(frame, fps_str, (10, 20), font, font_scale, text_color_border, thickness + 3)
+
+        # 원본 텍스트 그리기
+        text_color = (0, 255, 0)  # 텍스트 색상: 초록
+        cv2.putText(frame, fps_str, (10, 20), font, font_scale, text_color, thickness)
+
+    def get_cpu_usage(self, frame):
+        # CPU 점유율
+        cpu_usage = psutil.cpu_percent(interval=None)
+        cpu_text = f'CPU: {round(cpu_usage)}%'
+
+        # 변경사항 적용: 글씨체, 크기, 굵기, 테두리
+        font = cv2.FONT_HERSHEY_SIMPLEX  # 변경된 글씨체
+        font_scale = 0.7  # 변경된 글씨 크기
+        thickness = 2  # 변경된 굵기
+
+        # 테두리 그리기
+        text_color_border = (0, 0, 0)  # 테두리 색상: 검정
+        cv2.putText(frame, cpu_text, (10, 50), font, font_scale, text_color_border, thickness + 3)
+
+        # 원본 텍스트 그리기
+        text_color = (0, 255, 0)  # 텍스트 색상: 초록
+        cv2.putText(frame, cpu_text, (10, 50), font, font_scale, text_color, thickness)
+
+
+
+    def image_callback(self, data):
+        try:
+            # 현재 시간과 로고 표시 시작 시간의 차이 계산
+            time_since_logo_start = rospy.get_time() - self.logo_display_start
+
+            # 로고 표시 시간이 3초 미만인 경우
+            if time_since_logo_start < self.show_logo_time:
+                # 로고 이미지를 ROS 메시지로 변환하여 게시
+                try:
+                    if self.pub_image_type == "compressed":
+                        ros_image = self.cvBridge.cv2_to_compressed_imgmsg(self.logo_image, "jpg")
+                    else:  # "raw"
+                        ros_image = self.cvBridge.cv2_to_imgmsg(self.logo_image, "bgr8")
+                    self.image_pub.publish(ros_image)
+                except CvBridgeError as e:
+                    rospy.logerr("CvBridge 오류: %s" % e)
+                return
+
+            # 로고 표시 시간이 3초를 넘은 경우, 기존 프레임 처리 로직 실행
+            frame = self.cvBridge.imgmsg_to_cv2(data, "bgr8")
+            frame = cv2.resize(frame, (640, 480))  # 이미지 크기를 640x480으로 조정
+            self.process_frame(frame)
+        except CvBridgeError as e:
+            rospy.logerr(f"CvBridge Error: {e}")
+
+
+    def process_frame(self, frame):
+        height, width = frame.shape[:2]
+        screen_center_y = height // 2  # 화면 중앙 y 좌표
+
+        # frame center
+        whalf = width // 2
+        hhalf = height // 2
+        
+        # 픽셀-센티미터 변환 비율
+        pixel_to_cm_ratio = 50  # 10 픽셀이 1cm
+
+        # object_detector 함수로 검출 결과 얻기
+        xyxy, xywh = self.get_bboxes_xyxy(frame)
+        for bbox in xyxy:
+            x1, y1, x2, y2 = bbox
+            center_x, center_y = int((x1 + x2) / 2), int((y1 + y2) / 2)
+
+            # 중심점에 검은색 점 찍기
+            cv2.circle(frame, (center_x, center_y), 5, (0, 0, 0), -1)
+
+            # 중앙과의 거리 계산 및 표시 (센티미터 단위)
+            distance_y = (center_y - screen_center_y) / pixel_to_cm_ratio
+            distance_text = f"Vertical Gap: {distance_y:.2f}cm"
+            
+            # 글씨 테두리 (검은색)
+            font_scale = 0.7
+            thickness = 2
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            text_size = cv2.getTextSize(distance_text, font, font_scale, thickness)[0]
+            text_x = center_x + 10
+            text_y = center_y - text_size[1] - 10  # 텍스트를 검은 점 위쪽으로 이동
+
+            cv2.putText(frame, distance_text, (text_x, text_y), font, font_scale, (0, 0, 0), thickness + 3)
+
+            # 글씨 (흰색)
+            cv2.putText(frame, distance_text, (text_x, text_y), font, font_scale, (255, 255, 255), thickness)
+
+        # 여기에 정지 신호 발행 로직 추가
+        real_h = 10
+        stop_threshold = 10
+        h_per_pixel = real_h / (y2 - y1)
+        distance = round((hhalf - center_y) * h_per_pixel, 2)
+
+        if abs(distance) < stop_threshold:
+            stop_signal = Float64()
+            stop_signal.data = 1.0
+            self.pub_stop_signal.publish(stop_signal)
+        else:
+            stop_signal = Float64()
+            stop_signal.data = 0.0
+            self.pub_stop_signal.publish(stop_signal)
+
+
+
+        for item in xyxy:
+            masked_f = frame.copy()
+            out_bbox = [float(x1 - self.out_bb), float(y1 - self.out_bb), float(x2 + self.out_bb), float(y2 + self.out_bb)]
+            in_bbox = [float(x1 + self.in_bb), float(y1 + self.in_bb), float(x2 - self.in_bb), float(y2 - self.in_bb)]
+
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+            edges = cv2.Canny(blurred, 50, 100)
+            contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+            for contour in contours:
+                if cv2.contourArea(contour) > 300:
+                    rect = cv2.minAreaRect(contour)
+                    box = cv2.boxPoints(rect)
+                    box = np.int0(box)
+
+                    if (
+                        self.inoutside_determine(box, in_bbox) == 8
+                        and
+                        self.inoutside_determine(box, out_bbox) == 4
+                    ):
+                        for point in box:
+                            cv2.circle(frame, tuple(point), 5, (255, 0, 0), -1)
+
+                        sorted_box = sorted(box, key=lambda point: point[1], reverse=True)
+                        C_xhalf = int((sorted_box[0][0] + sorted_box[3][0]) / 2)
+                        C_yhalf = int((sorted_box[0][1] + sorted_box[3][1]) / 2)
+                        cv2.circle(frame, (int((sorted_box[0][0] + sorted_box[3][0]) / 2), int((sorted_box[0][1] + sorted_box[3][1]) / 2)), 5, (0, 0, 0), -1)
+
+                        dx = whalf - C_xhalf
+                        dy = hhalf - C_yhalf - 150
+                        sorted_box_moved = [[point[0] + dx, point[1] + dy] for point in sorted_box]
+                        angle_moved_h = [int((sorted_box_moved[2][0] + sorted_box_moved[3][0]) / 2),
+                                         int((sorted_box_moved[2][1] + sorted_box_moved[3][1]) / 2)]
+                        moved_C_center = [C_xhalf + dx, C_yhalf + dy]
+
+                        #angle = self.calculate_angle([whalf, 0], moved_C_center, angle_moved_h)
+                        #if angle >= 45 or angle == 0:
+                         #   cv2.putText(frame, f"Stable", (whalf-50, C_yhalf+dy+30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2, cv2.LINE_AA)
+                        #else:
+                         #   cv2.putText(frame, f"{angle}", (whalf-50, C_yhalf+dy+30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 0), 2, cv2.LINE_AA)
+                          #  cv2.line(frame, angle_moved_h, moved_C_center, (255, 0, 0), 1)
+
+                        cv2.drawContours(frame, [box], 0, (0, 255, 0), 2)
+                    else:
+                        continue
+
+        if x1 and y1 and x2 and y2:
+            # 다음 코드로 변경하여 안쪽 박스의 색을 초록색(0, 255, 0)으로 설정합니다.
+            cv2.rectangle(frame, (int(x1 + self.in_bb), int(y1 + self.in_bb)), (int(x2 - self.in_bb), int(y2 - self.in_bb)), (0, 255, 0), 2)
+            
+            if center_y <= hhalf+3 and center_y >= hhalf-3:
+                cv2.putText(frame, f"Centered", (whalf - 50, hhalf), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2, cv2.LINE_AA)
+        else:
+            print("인식되는 오브젝트가 없습니다.")
+
+        #cv2.line(frame, [whalf, 0], [whalf, 90], (255, 0, 0), 2)
+        cv2.circle(frame, (whalf, hhalf), 5, (0, 0, 255), -1)
+
+        self.webcam_FPS_output(frame)
+        self.get_cpu_usage(frame)
+
+        # 이미지를 ROS 메시지로 변환하여 게시
+        try:
+            if self.pub_image_type == "compressed":
+                ros_image = self.cvBridge.cv2_to_compressed_imgmsg(frame, "jpg")
+            else:  # "raw"
+                ros_image = self.cvBridge.cv2_to_imgmsg(frame, "bgr8")
+            self.image_pub.publish(ros_image)
+        except CvBridgeError as e:
+            rospy.logerr(e)
+
+    def main(self):
+        rospy.spin()
+
+if __name__ == '__main__':
+    node = WebcamDetector()
+    node.main()
+
